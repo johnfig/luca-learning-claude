@@ -731,18 +731,72 @@
 </div>
 
 <script type="module">
-  import { KokoroTTS } from 'https://esm.sh/kokoro-js';
 
-  /* ── State ───────────────────────────────────────────────────── */
-  let kokoroTTS  = null;
-  let audioCtx   = null;
-  let activeSrc  = null;
+  /* ── Kokoro TTS — runs in a Web Worker (never blocks the UI) ─── */
+  let worker      = null;
+  let workerReady = false;
+  let audioCtx    = null;
+  let activeSrc   = null;
+
+  const audioCache = new Map();   // text → AudioBuffer  (instant replay)
+  const queued     = new Set();   // texts currently generating in worker
+  const pending    = new Map();   // reqId → text
+  let   nextId     = 0;
 
   const loader    = document.getElementById('tts-loader');
   const loaderBar = document.getElementById('loader-bar');
 
-  /* ── Web Speech API fallback ─────────────────────────────────── */
-  const FEMALE_VOICES = [
+  function startWorker() {
+    worker = new Worker('./tts-worker.js', { type: 'module' });
+
+    let pct = 5;
+    const tick = setInterval(() => {
+      pct = Math.min(pct + Math.random() * 5, 88);
+      loaderBar.style.width = pct + '%';
+    }, 500);
+
+    const dismiss = () => {
+      clearInterval(tick);
+      loaderBar.style.width = '100%';
+      setTimeout(() => loader.remove(), 350);
+    };
+
+    worker.onmessage = async ({ data }) => {
+      if (data.type === 'ready') {
+        workerReady = true;
+        audioCtx = new AudioContext();
+        dismiss();
+      } else if (data.type === 'audio') {
+        const text = pending.get(data.id);
+        pending.delete(data.id);
+        queued.delete(text);
+        if (text && audioCtx) {
+          try {
+            const buf = audioCtx.createBuffer(1, data.samples.length, data.sr);
+            buf.copyToChannel(data.samples, 0);
+            audioCache.set(text, buf);
+          } catch (_) {}
+        }
+      } else if (data.type === 'fail') {
+        queued.delete(pending.get(data.id));
+        pending.delete(data.id);
+        if (!workerReady) dismiss();
+      }
+    };
+
+    worker.onerror = dismiss;
+  }
+
+  function queueGenerate(text) {
+    if (!workerReady || audioCache.has(text) || queued.has(text)) return;
+    queued.add(text);
+    const id = nextId++;
+    pending.set(id, text);
+    worker.postMessage({ type: 'generate', text, id });
+  }
+
+  /* ── Web Speech API — instant fallback while Kokoro generates ── */
+  const PREF_VOICES = [
     'Samantha','Karen','Moira','Tessa','Fiona','Victoria',
     'Google US English','Microsoft Zira','Microsoft Jenny',
   ];
@@ -750,7 +804,7 @@
   function loadFallbackVoice() {
     const voices = window.speechSynthesis.getVoices();
     if (!voices.length) return;
-    for (const name of FEMALE_VOICES) {
+    for (const name of PREF_VOICES) {
       const v = voices.find(v => v.name === name);
       if (v) { fallbackVoice = v; return; }
     }
@@ -771,54 +825,24 @@
     window.speechSynthesis.speak(u);
   }
 
-  /* ── Skip button → dismiss loader and use fallback ───────────── */
-  document.getElementById('loader-skip').addEventListener('click', () => {
-    loader.remove();
-  });
-
-  /* ── Load Kokoro neural TTS ──────────────────────────────────── */
-  async function initKokoro() {
-    try {
-      let pct = 3;
-      const tick = setInterval(() => {
-        pct = Math.min(pct + Math.random() * 5, 88);
-        loaderBar.style.width = pct + '%';
-      }, 500);
-
-      kokoroTTS = await KokoroTTS.from_pretrained(
-        'onnx-community/Kokoro-82M-v1.0-ONNX',
-        { dtype: 'q8' }
-      );
-      audioCtx = new AudioContext();
-
-      clearInterval(tick);
-      loaderBar.style.width = '100%';
-      await new Promise(r => setTimeout(r, 350));
-      loader.remove();
-    } catch (err) {
-      console.warn('Kokoro TTS unavailable, using browser voice:', err);
-      loader.remove();
-    }
-  }
-
-  /* ── speak() — Kokoro when ready, Web Speech API as fallback ─── */
+  /* ── speak()
+       Cache hit  → instant natural Kokoro audio
+       Cache miss → instant Web Speech API + queue Kokoro for next time ── */
   async function speak(text) {
-    if (!kokoroTTS) { speakFallback(text); return; }
-    try {
+    if (audioCache.has(text) && audioCtx) {
       if (activeSrc) { try { activeSrc.stop(); } catch(_){} activeSrc = null; }
       if (audioCtx.state === 'suspended') await audioCtx.resume();
-      const { audio, sampling_rate } = await kokoroTTS.generate(text, { voice: 'af_heart' });
-      const buf = audioCtx.createBuffer(1, audio.length, sampling_rate);
-      buf.copyToChannel(audio, 0);
       activeSrc = audioCtx.createBufferSource();
-      activeSrc.buffer = buf;
+      activeSrc.buffer = audioCache.get(text);
       activeSrc.connect(audioCtx.destination);
       activeSrc.start();
-    } catch (err) {
-      console.warn('Kokoro generate error:', err);
-      speakFallback(text);
+    } else {
+      speakFallback(text);   // instant
+      queueGenerate(text);   // Kokoro caches in background
     }
   }
+
+  document.getElementById('loader-skip').addEventListener('click', () => loader.remove());
 
   /* ── Navigation ─────────────────────────────────────────────── */
   function goTo(id) {
@@ -944,7 +968,7 @@
   window.changeNumber = changeNumber;
   window.sayNumber    = sayNumber;
 
-  initKokoro();
+  startWorker();
 </script>
 </body>
 </html>
